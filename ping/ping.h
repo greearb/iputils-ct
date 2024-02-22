@@ -175,6 +175,8 @@ struct ping_rts {
 	int deadline;			/* time to die */
 	int lingertime;
 	struct timespec start_time, cur_time;
+	struct timespec req_xmit_time;
+	int preload_left; /* how many more to preload */
 	volatile int exiting;
 	volatile int status_snapshot;
 	int confirm;
@@ -305,6 +307,22 @@ static inline void tvsub(struct timeval *out, struct timeval *in)
 		out->tv_usec += 1000000;
 	}
 	out->tv_sec -= in->tv_sec;
+}
+
+static inline void tsincr(struct timespec *out, int msec)
+{
+	if (msec) {
+		long incr_msecs = msec % 1000;
+		long incr_secs = msec / 1000;
+		long incr_nsecs = incr_msecs * 1000000;
+
+		if (out->tv_nsec + incr_nsecs > 1000000000) {
+			incr_secs++;
+			incr_nsecs -= 1000000000;
+		}
+		out->tv_sec += incr_secs;
+		out->tv_nsec += incr_nsecs;
+	}
 }
 
 /*

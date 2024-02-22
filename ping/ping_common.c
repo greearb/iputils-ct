@@ -309,12 +309,13 @@ void print_timestamp(struct ping_rts *rts)
  * and the sequence number is an ascending integer.  The first several bytes
  * of the data portion are used to hold a UNIX "timeval" struct in VAX
  * byte-order, to compute the round-trip time.
+ * Returns miliseconds we should wait before doing next transmission.
  */
 int pinger(struct ping_rts *rts, ping_func_set_st *fset, socket_st *sock)
 {
 	static int oom_count;
-	static int tokens;
 	int i;
+	long ms_until_xmit = rts->interval;
 
 	/* Have we already sent enough? If we have, return an arbitrary positive value. */
 	if (rts->exiting || (rts->npackets && rts->ntransmitted >= rts->npackets && !rts->deadline))
@@ -323,29 +324,34 @@ int pinger(struct ping_rts *rts, ping_func_set_st *fset, socket_st *sock)
 	/* Check that packets < rate*time + preload */
 	if (rts->cur_time.tv_sec == 0 && rts->cur_time.tv_nsec == 0) {
 		clock_gettime(CLOCK_MONOTONIC_RAW, &rts->cur_time);
-		tokens = rts->interval * (rts->preload - 1);
+		rts->req_xmit_time = rts->cur_time;
+		rts->preload_left = rts->preload - 1;
 	} else {
-		long ntokens, tmp;
 		struct timespec tv;
 
 		clock_gettime(CLOCK_MONOTONIC_RAW, &tv);
-		ntokens = (tv.tv_sec - rts->cur_time.tv_sec) * 1000 +
-			  (tv.tv_nsec - rts->cur_time.tv_nsec) / 1000000;
+		rts->cur_time = tv;
+		if (rts->preload_left) {
+			ms_until_xmit = 0;
+		}
+		else {
+			ms_until_xmit = (rts->req_xmit_time.tv_sec - tv.tv_sec) * 1000 +
+				        (rts->req_xmit_time.tv_nsec - tv.tv_nsec) / 1000000;
+		}
+		/* printf("ms-until-xmit: %ld tv: %ld: %ld  req-xmit: %ld: %ld preload_left: %d\n",
+		       ms_until_xmit, tv.tv_sec, tv.tv_nsec,
+		       rts->req_xmit_time.tv_sec, rts->req_xmit_time.tv_nsec, rts->preload_left);*/
 		if (!rts->interval) {
 			/* Case of unlimited flood is special;
 			 * if we see no reply, they are limited to 100pps */
-			if (ntokens < MIN_INTERVAL_MS && in_flight(rts) >= rts->preload)
-				return MIN_INTERVAL_MS - ntokens;
+			if (ms_until_xmit < MIN_INTERVAL_MS && in_flight(rts) >= rts->preload)
+				return MIN_INTERVAL_MS - ms_until_xmit;
 		}
-		ntokens += tokens;
-		tmp = (long)rts->interval * (long)rts->preload;
-		if (tmp < ntokens)
-			ntokens = tmp;
-		if (ntokens < rts->interval)
-			return rts->interval - ntokens;
-
-		rts->cur_time = tv;
-		tokens = ntokens - rts->interval;
+		if (ms_until_xmit > 0) {
+			/*printf("pinger returns early, ms_until_xmit: %ld  interval: %d\n",
+			         ms_until_xmit, rts->interval);*/
+			return ms_until_xmit;
+		}
 	}
 
 	if (rts->opt_outstanding) {
@@ -355,6 +361,14 @@ int pinger(struct ping_rts *rts, ping_func_set_st *fset, socket_st *sock)
 			fflush(stdout);
 		}
 	}
+
+	/* Increment requested xmit timer by interval. */
+	/*printf("check increment xmit interval, preload left: %d\n",
+	         rts->preload_left); */
+	if (rts->preload_left)
+		rts->preload_left--;
+	else
+		tsincr(&rts->req_xmit_time, rts->interval);
 
 resend:
 	i = fset->send_probe(rts, sock, rts->outpack, sizeof(rts->outpack));
@@ -369,7 +383,21 @@ resend:
 			    in_flight(rts) < rts->screen_width)
 				write_stdout(".", 1);
 		}
-		return rts->interval - tokens;
+		if (rts->preload_left) {
+			ms_until_xmit = 0;
+		}
+		else {
+			/* Could get current time again here, but it will work out anyway, so skip
+			 * the extra system call.
+			 */
+			ms_until_xmit = (rts->req_xmit_time.tv_sec - rts->cur_time.tv_sec) * 1000 +
+				        (rts->req_xmit_time.tv_nsec - rts->cur_time.tv_nsec) / 1000000;
+		}
+		/* printf("tx sucessfully, ms-until-xmit: %ld  interval: %d\n",
+		          ms_until_xmit, rts->interval);*/
+		if (ms_until_xmit < 0)
+			return 0;
+		return ms_until_xmit;
 	}
 
 	/* And handle various errors... */
@@ -380,7 +408,6 @@ resend:
 		int nores_interval;
 
 		/* Device queue overflow or OOM. Packet is not sent. */
-		tokens = 0;
 		/* Slowdown. This works only in adaptive mode (option -A) */
 		rts->rtt_addend += (rts->rtt < 8 * 50000 ? rts->rtt / 8 : 50000);
 		if (rts->opt_adaptive)
@@ -393,12 +420,11 @@ resend:
 			return nores_interval;
 		i = 0;
 		/* Fall to hard error. It is to avoid complete deadlock
-		 * on stuck output device even when dealine was not requested.
+		 * on stuck output device even when deadline was not requested.
 		 * Expected timings are screwed up in any case, but we will
 		 * exit some day. :-) */
 	} else if (errno == EAGAIN) {
 		/* Socket buffer is full. */
-		tokens += rts->interval;
 		return MIN_INTERVAL_MS;
 	} else {
 		if ((i = fset->receive_error_msg(rts, sock)) > 0) {
@@ -430,7 +456,6 @@ hard_local_error:
 		else
 			error(0, errno, "sendmsg");
 	}
-	tokens = 0;
 	return SCHINT(rts->interval);
 }
 
